@@ -1,19 +1,22 @@
 """
-FASTAPI BACKEND — EMERALD LANKA EVAPORATION PREDICTOR v2.0
+FASTAPI BACKEND — EMERALD LANKA EVAPORATION PREDICTOR v3.0
 ============================================================
-Standalone evaporation predictor with daily cron support.
+Every retrain automatically:
+  1. Fetches latest weather from Open-Meteo
+  2. Retrains 4 XGBoost models
+  3. Calculates evaporation for ALL sales dates in Firebase
+  4. Stores/overwrites Firebase fuelEvaporation collection
 
-Run: uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+Run: uvicorn api.main:app --host 0.0.0.0 --port $PORT
 
 Endpoints:
   GET  /                          → welcome
   GET  /health                    → server status
-  GET  /predict/evaporation       → tomorrow evaporation (ML + weather)
-  GET  /predict/evaporation/7days → 7-day evaporation forecast
+  GET  /predict/evaporation       → tomorrow's prediction
+  GET  /predict/evaporation/7days → 7-day forecast
   GET  /predict/summary           → tomorrow + 7days combined
-  GET  /evaporation/history       → stored history from Firebase
-  POST /retrain                   → retrain evaporation models
-  POST /cron/daily                → called by Railway cron every night
+  GET  /evaporation/history       → history from Firebase
+  POST /retrain                   → retrain + auto-store to Firebase
 """
 
 import os
@@ -58,9 +61,12 @@ def clean_json(obj):
 # ─── APP SETUP ────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Emerald Lanka Evaporation Predictor v2.0",
-    description="ML evaporation forecasting + daily Firebase storage",
-    version="2.0.0"
+    title="Emerald Lanka Evaporation Predictor v3.0",
+    description=(
+        "ML evaporation forecasting. "
+        "Every retrain auto-stores all historical data to Firebase."
+    ),
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -73,7 +79,7 @@ app.add_middleware(
 
 # ─── STARTUP ──────────────────────────────────────────────────────────────────
 
-print("\n🚀 Starting Evaporation Predictor API v2.0...")
+print("\n🚀 Starting Evaporation Predictor API v3.0...")
 
 print("   Loading evaporation models...")
 EVAP_MODELS = load_evap_models("models/evaporation")
@@ -88,12 +94,16 @@ try:
     LATEST_DATE = EVAP_HISTORY_DF["date"].max().date()
     print(f"   Evap history: {len(EVAP_HISTORY_DF)} rows, latest: {LATEST_DATE}")
 except Exception as e:
-    print(f"   ⚠️  Could not load evaporation history: {e}")
+    print(f"   ⚠️  Evap history not found: {e}")
 
-RETRAIN_STATUS = {"running": False, "last_run": None}
-CRON_STATUS    = {"last_run": None, "last_result": None}
+RETRAIN_STATUS = {
+    "running":      False,
+    "last_run":     None,
+    "last_result":  None,
+    "last_stored":  None,
+}
 
-print(f"   ✅ API ready! {len(EVAP_MODELS)} evap models loaded\n")
+print(f"   ✅ API ready! {len(EVAP_MODELS)} models loaded\n")
 
 EVAP_ACCURACY = {
     "petrol":       {"holdout_mape": 3.27,  "cv_mape": 9.82,  "reliability": "high"},
@@ -105,7 +115,7 @@ EVAP_ACCURACY = {
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-def get_average_sales() -> dict:
+def get_avg_sales() -> dict:
     if EVAP_HISTORY_DF is None:
         return {"petrol": 2500.0, "super_petrol": 80.0,
                 "diesel": 2800.0, "super_diesel": 120.0}
@@ -119,12 +129,12 @@ def get_average_sales() -> dict:
 
 
 def build_sales_dict(n_days: int = 7) -> dict:
-    avg      = get_average_sales()
+    avg      = get_avg_sales()
     tomorrow = LATEST_DATE + timedelta(days=1)
     result   = {}
     for fuel in ["petrol", "super_petrol", "diesel", "super_diesel"]:
         result[f"{fuel}_sales"] = [
-            {"date": str(tomorrow + timedelta(days=i)),
+            {"date":             str(tomorrow + timedelta(days=i)),
              "predicted_litres": round(float(avg[fuel]), 2)}
             for i in range(n_days)
         ]
@@ -136,32 +146,25 @@ def build_sales_dict(n_days: int = 7) -> dict:
 @app.get("/")
 def root():
     return {
-        "api":      "Emerald Lanka Evaporation Predictor v2.0",
-        "station":  "Emerald Lanka Filling Station, Hettipola",
-        "model":    "XGBoost + Open-Meteo weather",
-        "docs":     "/docs",
-        "endpoints": [
-            "GET  /health",
-            "GET  /predict/evaporation",
-            "GET  /predict/evaporation/7days",
-            "GET  /predict/summary",
-            "GET  /evaporation/history",
-            "POST /retrain",
-            "POST /cron/daily",
-        ]
+        "api":     "Emerald Lanka Evaporation Predictor v3.0",
+        "station": "Emerald Lanka Filling Station, Hettipola",
+        "model":   "XGBoost + Open-Meteo weather",
+        "docs":    "/docs",
+        "note":    "POST /retrain to retrain models and auto-update Firebase",
     }
 
 
 @app.get("/health")
 def health():
     return clean_json({
-        "status":              "healthy",
-        "evap_models":         list(EVAP_MODELS.keys()),
-        "data_latest_date":    str(LATEST_DATE),
-        "retrain_running":     RETRAIN_STATUS["running"],
-        "last_cron_run":       CRON_STATUS["last_run"],
-        "last_cron_result":    CRON_STATUS["last_result"],
-        "timestamp":           datetime.now().isoformat(),
+        "status":             "healthy",
+        "evap_models":        list(EVAP_MODELS.keys()),
+        "data_latest_date":   str(LATEST_DATE),
+        "retrain_running":    RETRAIN_STATUS["running"],
+        "last_retrain":       RETRAIN_STATUS["last_run"],
+        "last_result":        RETRAIN_STATUS["last_result"],
+        "last_firebase_store": RETRAIN_STATUS["last_stored"],
+        "timestamp":          datetime.now().isoformat(),
     })
 
 
@@ -195,7 +198,7 @@ def predict_tomorrow():
 
 @app.get("/predict/evaporation/7days")
 def predict_7_days():
-    """7-day evaporation forecast using ML model + weather forecast per day."""
+    """7-day evaporation forecast."""
     try:
         start_date  = LATEST_DATE + timedelta(days=1)
         sales_preds = build_sales_dict(n_days=7)
@@ -222,7 +225,7 @@ def predict_7_days():
 
 @app.get("/predict/summary")
 def predict_summary():
-    """★ RECOMMENDED FOR FLUTTER — tomorrow + 7-day in one call."""
+    """★ FLUTTER — tomorrow + 7-day in one call."""
     try:
         tomorrow    = LATEST_DATE + timedelta(days=1)
         sales_preds = build_sales_dict(n_days=7)
@@ -256,26 +259,24 @@ def predict_summary():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── HISTORY ENDPOINT ────────────────────────────────────────────────────────
+# ─── HISTORY FROM FIREBASE ───────────────────────────────────────────────────
 
 @app.get("/evaporation/history")
 def get_history(days: int = 30):
     """
-    Returns stored evaporation history from Firebase fuelEvaporation.
-    Used by Flutter to show historical charts.
-
-    Query param: ?days=30 (default 30, max 365)
+    Returns evaporation history from Firebase fuelEvaporation.
+    Used by Flutter HISTORY tab.
+    Query: ?days=30 (default 30, max 365)
     """
     try:
-        import json
-        from scripts.backfill_and_daily_evaporation import init_firebase
-        init_firebase()
+        from scripts.retrain_evap import _init_firebase
+        _init_firebase()
         from firebase_admin import firestore
 
-        days    = min(days, 365)
-        cutoff  = date.today() - timedelta(days=days)
-        db      = firestore.client()
-        docs    = db.collection('fuelEvaporation').stream()
+        days   = min(days, 365)
+        cutoff = date.today() - timedelta(days=days)
+        db     = firestore.client()
+        docs   = db.collection("fuelEvaporation").stream()
 
         records = []
         for doc in docs:
@@ -285,15 +286,20 @@ def get_history(days: int = 30):
                 d = date.fromisoformat(date_str)
                 if d >= cutoff:
                     records.append({
-                        "date":               date_str,
-                        "petrolEvapL":        float(data.get("petrolEvapL", 0)),
-                        "superPetrolEvapL":   float(data.get("superPetrolEvapL", 0)),
-                        "dieselEvapL":        float(data.get("dieselEvapL", 0)),
-                        "superDieselEvapL":   float(data.get("superDieselEvapL", 0)),
-                        "totalEvapL":         float(data.get("totalEvapL", 0)),
-                        "totalEvapLkr":       float(data.get("totalEvapLkr", 0)),
-                        "tempMaxC":           float(data.get("tempMaxC", 0)),
-                        "precipMm":           float(data.get("precipMm", 0)),
+                        "date":             date_str,
+                        "petrolEvapL":      float(data.get("petrolEvapL",      0) or 0),
+                        "superPetrolEvapL": float(data.get("superPetrolEvapL", 0) or 0),
+                        "dieselEvapL":      float(data.get("dieselEvapL",      0) or 0),
+                        "superDieselEvapL": float(data.get("superDieselEvapL", 0) or 0),
+                        "totalEvapL":       float(data.get("totalEvapL",       0) or 0),
+                        "totalEvapLkr":     float(data.get("totalEvapLkr",     0) or 0),
+                        "petrolSalesL":     float(data.get("petrolSalesL",     0) or 0),
+                        "dieselSalesL":     float(data.get("dieselSalesL",     0) or 0),
+                        "tempMaxC":         float(data.get("tempMaxC",         0) or 0),
+                        "precipMm":         float(data.get("precipMm",         0) or 0),
+                        "humidityMax":      float(data.get("humidityMax",      0) or 0),
+                        "et0Mm":            float(data.get("et0Mm",            0) or 0),
+                        "modelType":        data.get("modelType", "ml"),
                     })
             except Exception:
                 continue
@@ -304,77 +310,70 @@ def get_history(days: int = 30):
         total_lkr = sum(r["totalEvapLkr"] for r in records)
 
         return clean_json({
-            "generated_at":    datetime.now().isoformat(),
-            "days_requested":  days,
-            "records_found":   len(records),
-            "records":         records,
-            "period_total_L":  round(total_l, 3),
+            "generated_at":     datetime.now().isoformat(),
+            "days_requested":   days,
+            "records_found":    len(records),
+            "records":          records,
+            "period_total_L":   round(total_l, 3),
             "period_total_lkr": round(total_lkr, 2),
-            "annual_est_lkr":  round(total_lkr / len(records) * 365, 0)
-                               if records else 0,
+            "annual_est_lkr":   round(total_lkr / len(records) * 365, 0)
+                                if records else 0,
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── DAILY CRON ENDPOINT ─────────────────────────────────────────────────────
-
-@app.post("/cron/daily")
-def daily_cron(background_tasks: BackgroundTasks):
-    """
-    Called automatically every night at 10pm Sri Lanka time.
-    Calculates yesterday's evaporation using real weather
-    and stores it to Firebase fuelEvaporation.
-
-    Schedule this in Railway:
-      Settings → Cron Jobs → Add
-      Schedule: 30 16 * * *   (16:30 UTC = 22:00 Sri Lanka)
-      Command:  curl -X POST https://YOUR-URL.up.railway.app/cron/daily
-    """
-    CRON_STATUS["last_run"] = datetime.now().isoformat()
-    background_tasks.add_task(_run_daily_cron)
-    return {
-        "message":    "✅ Daily cron started",
-        "started_at": CRON_STATUS["last_run"],
-        "calculating": str(date.today() - timedelta(days=1)),
-    }
-
-
-def _run_daily_cron():
-    """Background: calculate yesterday's evaporation and store to Firebase."""
-    try:
-        print(f"\n⏰ Daily cron running for {date.today() - timedelta(days=1)}...")
-        from scripts.backfill_and_daily_evaporation import run_pipeline
-        run_pipeline(mode='daily')
-        CRON_STATUS["last_result"] = "success"
-        print("✅ Daily cron complete!\n")
-    except Exception as e:
-        CRON_STATUS["last_result"] = f"failed: {e}"
-        print(f"❌ Daily cron failed: {e}\n")
-
-
-# ─── RETRAIN ─────────────────────────────────────────────────────────────────
+# ─── RETRAIN — AUTO STORES TO FIREBASE ───────────────────────────────────────
 
 @app.post("/retrain")
 def trigger_retrain(background_tasks: BackgroundTasks):
-    """Retrain evaporation models + refresh weather data."""
+    """
+    Retrain evaporation models + automatically store all data to Firebase.
+
+    What happens:
+      1. Fetch latest weather from Open-Meteo
+      2. Retrain all 4 XGBoost models
+      3. Fetch all sales from Firebase fuelSaleHistory
+      4. Calculate evaporation for every date with the NEW models
+      5. Store/overwrite to Firebase fuelEvaporation
+         (retrain twice → second result overwrites first)
+
+    Takes 3-5 minutes. Check /health for status.
+    """
     if RETRAIN_STATUS["running"]:
-        return {"message": "Already retraining.", "started_at": RETRAIN_STATUS["last_run"]}
+        return {
+            "message":    "Retrain already running. Check /health.",
+            "started_at": RETRAIN_STATUS["last_run"],
+        }
     RETRAIN_STATUS["running"]  = True
     RETRAIN_STATUS["last_run"] = datetime.now().isoformat()
     background_tasks.add_task(_run_retrain)
-    return {"message": "✅ Retrain started.", "started_at": RETRAIN_STATUS["last_run"]}
+    return {
+        "message":    (
+            "✅ Retrain started. Models will be retrained and all "
+            "evaporation data will be stored to Firebase automatically. "
+            "Check /health in 3-5 minutes."
+        ),
+        "started_at": RETRAIN_STATUS["last_run"],
+    }
 
 
 def _run_retrain():
     global EVAP_MODELS
     try:
-        print("\n🔄 Evaporation retrain started...")
+        print("\n🔄 Retrain + Firebase store started...")
         from scripts.retrain_evap import full_evap_retrain_pipeline
-        full_evap_retrain_pipeline()
+        metrics = full_evap_retrain_pipeline()
+
+        # Reload fresh models into memory
         EVAP_MODELS = load_evap_models("models/evaporation")
-        RETRAIN_STATUS["running"] = False
-        print("✅ Evaporation retrain complete!\n")
+
+        RETRAIN_STATUS["running"]     = False
+        RETRAIN_STATUS["last_result"] = "success"
+        RETRAIN_STATUS["last_stored"] = datetime.now().isoformat()
+        print("✅ Retrain + Firebase store complete!\n")
+
     except Exception as e:
-        RETRAIN_STATUS["running"] = False
-        print(f"❌ Evaporation retrain failed: {e}\n")
+        RETRAIN_STATUS["running"]     = False
+        RETRAIN_STATUS["last_result"] = f"failed: {str(e)}"
+        print(f"❌ Retrain failed: {e}\n")
