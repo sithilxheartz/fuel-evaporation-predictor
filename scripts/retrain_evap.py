@@ -1,24 +1,20 @@
 """
-RETRAIN_EVAP.PY — EMERALD LANKA (Fixed)
-=========================================
-After retraining, syncs fuelEvaporation to always match fuelSaleHistory.
+RETRAIN_EVAP.PY — EMERALD LANKA (Final Fix)
+=============================================
+Uses TWO separate weather date ranges:
 
-Key fix:
-  - Date range comes from Firebase fuelSaleHistory (NOT local CSV)
+  TRAINING weather:   2025-04-01 → 2026-04-19  → weather_data.csv
+                      Matches fuel_sales_evaporation.csv (384 rows)
+                      → models train on full dataset → best accuracy
+
+  DEPLOYMENT weather: Firebase first date → last date  → weather_deploy.csv
+                      Matches fuelSaleHistory (Feb 2026 → today)
+                      → used to calculate evaporation for each sale date
+
+Result:
+  - Models always trained on 384 rows (best accuracy)
   - fuelEvaporation always matches fuelSaleHistory exactly
-  - Every date in fuelSaleHistory gets evaporation calculated
-  - If fuelSaleHistory has new dates → fuelEvaporation gets them too
-  - Second retrain → overwrites all records with fresh model results
-
-Flow:
-  1. Fetch latest weather from Open-Meteo
-  2. Retrain all 4 XGBoost models
-  3. Fetch ALL sales from Firebase fuelSaleHistory
-  4. Calculate evaporation for every date that has a sales record
-  5. Store/overwrite ALL to Firebase fuelEvaporation
-
-Run manually:
-  python scripts/retrain_evap.py
+  - Every retrain overwrites all Firebase records with fresh results
 """
 
 import os
@@ -46,18 +42,15 @@ def _init_firebase():
         if not os.path.exists(key_path):
             raise FileNotFoundError(
                 f"Firebase key not found: {key_path}\n"
-                "Add FIREBASE_CREDENTIALS environment variable on Railway."
+                "Add FIREBASE_CREDENTIALS env var on Railway."
             )
         cred = credentials.Certificate(key_path)
     firebase_admin.initialize_app(cred)
     print("  ✅ Firebase connected")
 
 
-def _fetch_all_sales_from_firebase() -> pd.DataFrame:
-    """
-    Fetch ALL sales records from Firebase fuelSaleHistory.
-    This is the source of truth for which dates need evaporation calculated.
-    """
+def _fetch_all_sales() -> pd.DataFrame:
+    """Fetch all sales from Firebase fuelSaleHistory."""
     _init_firebase()
     from firebase_admin import firestore
     db   = firestore.client()
@@ -87,10 +80,10 @@ def _fetch_all_sales_from_firebase() -> pd.DataFrame:
         })
 
     if not records:
-        raise ValueError("No records found in Firebase fuelSaleHistory")
+        raise ValueError("No records in Firebase fuelSaleHistory")
 
     df = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
-    print(f"  Fetched {len(df)} sales records from fuelSaleHistory")
+    print(f"  Fetched {len(df)} sales records")
     print(f"  Range: {df['date'].min().date()} → {df['date'].max().date()}")
     return df
 
@@ -103,69 +96,102 @@ def full_evap_retrain_pipeline():
     print("="*60)
     started = datetime.now()
 
-    # ── Step 1: Fetch ALL sales from Firebase first ───────────────────────────
-    # We do this BEFORE fetching weather so we know the exact date range needed
-    print("\n[1/5] Fetching sales from Firebase fuelSaleHistory...")
+    from scripts.fetch_weather import (
+        fetch_historical, _add_derived_features, fetch_forecast
+    )
+
+    # ── Step 1: Sales from Firebase ──────────────────────────────────────────
+    print("\n[1/6] Fetching sales from Firebase fuelSaleHistory...")
     _init_firebase()
-    sales_df   = _fetch_all_sales_from_firebase()
+    sales_df   = _fetch_all_sales()
     first_date = sales_df["date"].min().date()
     last_date  = sales_df["date"].max().date()
+    print(f"  Will calculate: {first_date} → {last_date} "
+          f"({(last_date-first_date).days+1} days)")
 
-    print(f"  Will calculate evaporation for: {first_date} → {last_date}")
-    print(f"  Total days: {(last_date - first_date).days + 1}")
-
-    # ── Step 2: Fetch weather for exact date range ────────────────────────────
-    print(f"\n[2/5] Fetching weather: {first_date} → {last_date}...")
+    # ── Step 2: Training weather — full evap CSV range ────────────────────────
+    # MUST match fuel_sales_evaporation.csv date range for full 384 rows
+    print("\n[2/6] Fetching TRAINING weather (full evap CSV range)...")
     try:
-        from scripts.fetch_weather import fetch_historical, _add_derived_features, fetch_forecast
+        evap_csv = pd.read_csv("data/fuel_sales_evaporation.csv")
+        evap_csv["date"] = pd.to_datetime(evap_csv["date"])
+        t_start  = evap_csv["date"].min().strftime("%Y-%m-%d")
+        t_end    = evap_csv["date"].max().strftime("%Y-%m-%d")
+    except Exception:
+        t_start  = "2025-04-01"
+        t_end    = "2026-04-19"
 
-        wx_df = fetch_historical(
-            str(first_date),
-            str(last_date),
-        )
-        wx_df.to_csv("data/weather_data.csv", index=False)
-        print(f"  Weather saved: {len(wx_df)} days")
+    try:
+        train_wx = fetch_historical(t_start, t_end)
+        train_wx.to_csv("data/weather_data.csv", index=False)
+        print(f"  Training weather: {len(train_wx)} days "
+              f"({t_start} → {t_end}) → weather_data.csv")
+    except Exception as e:
+        print(f"  ⚠️  Training weather failed: {e} — using existing")
 
-        # Also fetch 8-day forecast for predictions
+    # ── Step 3: Deployment weather — Firebase sales range ────────────────────
+    # Covers actual dates we store to fuelEvaporation
+    print(f"\n[3/6] Fetching DEPLOYMENT weather "
+          f"({first_date} → {last_date})...")
+    deploy_wx_df = pd.DataFrame()
+    try:
+        deploy_wx = fetch_historical(str(first_date), str(last_date))
+        deploy_wx.to_csv("data/weather_deploy.csv", index=False)
+        deploy_wx_df = deploy_wx
+        print(f"  Deployment weather: {len(deploy_wx)} days "
+              f"→ weather_deploy.csv")
+
         fcast = fetch_forecast(days_ahead=8)
         fcast.to_csv("data/weather_forecast.csv", index=False)
-        print(f"  Forecast saved: {len(fcast)} days")
-
+        print(f"  Forecast: {len(fcast)} days → weather_forecast.csv")
     except Exception as e:
-        print(f"  ⚠️  Weather fetch failed: {e}")
-        print("  Continuing with existing weather data...")
-        wx_df = None
+        print(f"  ⚠️  Deployment weather failed: {e}")
+        # Try loading existing deploy weather
+        try:
+            deploy_wx_df = pd.read_csv("data/weather_deploy.csv")
+            deploy_wx_df["date"] = pd.to_datetime(deploy_wx_df["date"])
+            print(f"  Using cached deployment weather: "
+                  f"{len(deploy_wx_df)} days")
+        except Exception:
+            print("  No deployment weather — will use formula fallback")
 
-    # ── Step 3: Retrain all 4 evaporation models ──────────────────────────────
-    print("\n[3/5] Training evaporation models...")
+    # ── Step 4: Train models on FULL dataset (384 rows) ───────────────────────
+    # train_evap_models.py uses weather_data.csv which now covers full range
+    print("\n[4/6] Training models on FULL 384-row dataset...")
     from scripts.train_evap_models import train_all_evap_models
     metrics = train_all_evap_models()
 
-    # ── Step 4: Load fresh models + weather ──────────────────────────────────
-    print("\n[4/5] Loading fresh models and weather data...")
+    # ── Step 5: Load fresh models ─────────────────────────────────────────────
+    print("\n[5/6] Loading fresh models...")
     from scripts.predict_evap import (
         load_evap_models,
         predict_evaporation_ml,
         FUEL_PRICES_LKR,
         FALLBACK_MONTHLY_RATES,
     )
-
     evap_models = load_evap_models("models/evaporation")
-    print(f"  Loaded {len(evap_models)} fresh models")
+    print(f"  Loaded {len(evap_models)} models")
 
-    # Load weather
-    try:
-        wx_df = pd.read_csv("data/weather_data.csv")
-        wx_df["date"] = pd.to_datetime(wx_df["date"])
-    except Exception as e:
-        print(f"  ⚠️  Weather data not available: {e}")
-        wx_df = pd.DataFrame()
+    # Load deployment weather for lookups
+    if deploy_wx_df.empty:
+        try:
+            deploy_wx_df = pd.read_csv("data/weather_deploy.csv")
+            deploy_wx_df["date"] = pd.to_datetime(deploy_wx_df["date"])
+        except Exception:
+            pass
 
-    # ── Step 5: Calculate + store evaporation for ALL sales dates ─────────────
-    print(f"\n[5/5] Calculating + storing evaporation for ALL {len(sales_df)} dates...")
-    print("  (overwrites existing records with fresh model results)")
+    weather_lookup = {}
+    if not deploy_wx_df.empty:
+        weather_lookup = {
+            row["date"].strftime("%Y-%m-%d"): row
+            for _, row in deploy_wx_df.iterrows()
+        }
+    print(f"  Weather lookup: {len(weather_lookup)} dates")
 
-    # Build lookups
+    # ── Step 6: Calculate + store ALL evaporation ────────────────────────────
+    print(f"\n[6/6] Calculating + storing {len(sales_df)} evaporation records...")
+    print("  Overwrites existing Firebase records with fresh model results")
+
     sales_lookup = {
         row["date"].strftime("%Y-%m-%d"): {
             "petrol":       float(row["petrol"])       if row["petrol"] > 0       else 2500.0,
@@ -176,14 +202,6 @@ def full_evap_retrain_pipeline():
         for _, row in sales_df.iterrows()
     }
 
-    weather_lookup = {}
-    if not wx_df.empty:
-        weather_lookup = {
-            row["date"].strftime("%Y-%m-%d"): row
-            for _, row in wx_df.iterrows()
-        }
-
-    # Load evap history for lag features
     evap_history = []
     try:
         hist_df      = pd.read_csv("data/fuel_sales_evaporation.csv")
@@ -194,20 +212,17 @@ def full_evap_retrain_pipeline():
     FUEL_TYPES = ["petrol", "super_petrol", "diesel", "super_diesel"]
 
     from firebase_admin import firestore
-    db = firestore.client()
-
-    success     = 0
-    failed      = 0
+    db          = firestore.client()
     batch       = db.batch()
     batch_count = 0
     MAX_BATCH   = 400
+    success     = 0
+    failed      = 0
 
-    # Process every date that has a sales record in Firebase
     for _, sale_row in sales_df.iterrows():
         target_date = sale_row["date"].date()
         date_str    = str(target_date)
-
-        sales  = sales_lookup.get(date_str, {
+        sales       = sales_lookup.get(date_str, {
             "petrol": 2500.0, "super_petrol": 80.0,
             "diesel": 2800.0, "super_diesel": 120.0,
         })
@@ -219,14 +234,12 @@ def full_evap_retrain_pipeline():
                 "generatedAt": datetime.now().isoformat(),
                 "modelType":   "ml_xgboost_weather",
             }
-
             total_L   = 0.0
             total_lkr = 0.0
 
             for fuel in FUEL_TYPES:
                 sales_L = float(sales.get(fuel, 2000.0))
 
-                # Use ML model + real weather if available
                 if fuel in evap_models and not wx_row.empty:
                     try:
                         evap_L = predict_evaporation_ml(
@@ -249,45 +262,34 @@ def full_evap_retrain_pipeline():
                 evap_L   = round(float(max(0, evap_L)), 5)
                 evap_lkr = round(evap_L * FUEL_PRICES_LKR[fuel], 2)
 
-                # Map to Firebase field names
-                fuel_key = {
-                    "petrol":       "petrol",
-                    "super_petrol": "superPetrol",
-                    "diesel":       "diesel",
-                    "super_diesel": "superDiesel",
-                }[fuel]
-
-                doc_data[f"{fuel_key}EvapL"]   = evap_L
-                doc_data[f"{fuel_key}EvapLkr"] = evap_lkr
-                doc_data[f"{fuel_key}SalesL"]  = round(sales_L, 2)
+                fk = {"petrol":"petrol","super_petrol":"superPetrol",
+                      "diesel":"diesel","super_diesel":"superDiesel"}[fuel]
+                doc_data[f"{fk}EvapL"]   = evap_L
+                doc_data[f"{fk}EvapLkr"] = evap_lkr
+                doc_data[f"{fk}SalesL"]  = round(sales_L, 2)
 
                 total_L   += evap_L
                 total_lkr += evap_lkr
-
                 if fuel == "petrol":
                     evap_history.append(evap_L)
 
-            # Summary
             doc_data["totalEvapL"]   = round(total_L, 5)
             doc_data["totalEvapLkr"] = round(total_lkr, 2)
 
-            # Weather context
             if not wx_row.empty:
-                doc_data["tempMaxC"]    = float(wx_row.get("temp_max_c",  0) or 0)
-                doc_data["precipMm"]    = float(wx_row.get("precip_mm",   0) or 0)
-                doc_data["humidityMax"] = float(wx_row.get("humidity_max",0) or 0)
-                doc_data["et0Mm"]       = float(wx_row.get("et0_mm",      0) or 0)
+                doc_data["tempMaxC"]    = float(wx_row.get("temp_max_c",   0) or 0)
+                doc_data["precipMm"]    = float(wx_row.get("precip_mm",    0) or 0)
+                doc_data["humidityMax"] = float(wx_row.get("humidity_max", 0) or 0)
+                doc_data["et0Mm"]       = float(wx_row.get("et0_mm",       0) or 0)
 
-            # Batch write — set() overwrites if exists, creates if not
             ref = db.collection("fuelEvaporation").document(date_str)
             batch.set(ref, doc_data)
             batch_count += 1
             success     += 1
 
-            # Commit batch when full
             if batch_count >= MAX_BATCH:
                 batch.commit()
-                print(f"  Committed batch of {batch_count} records...")
+                print(f"  Committed batch of {batch_count}...")
                 batch       = db.batch()
                 batch_count = 0
 
@@ -295,25 +297,21 @@ def full_evap_retrain_pipeline():
             print(f"  ❌ {date_str}: {e}")
             failed += 1
 
-    # Commit remaining records
     if batch_count > 0:
         batch.commit()
 
     elapsed = (datetime.now() - started).seconds
-
     print(f"\n{'='*60}")
-    print(f"  RETRAIN + FIREBASE SYNC COMPLETE in {elapsed}s")
-    print(f"{'='*60}")
-    print(f"  ✅ Stored {success} records to Firebase fuelEvaporation")
-    print(f"  📅 Range: {first_date} → {last_date}")
-    if failed > 0:
-        print(f"  ❌ Failed: {failed}")
+    print(f"  ✅ COMPLETE in {elapsed}s")
+    print(f"  Stored:  {success} records to Firebase fuelEvaporation")
+    print(f"  Range:   {first_date} → {last_date}")
+    if failed:
+        print(f"  Failed:  {failed}")
     print()
-    print("  Model accuracy:")
+    print("  Model accuracy (trained on full 384-row dataset):")
     for fuel, m in metrics.items():
-        print(f"    {fuel:<20} CV MAPE: {m['cv_mape']:.2f}%  "
+        print(f"    {fuel:<20} CV: {m['cv_mape']:.2f}%  "
               f"Holdout: {m['holdout_mape']:.2f}%")
-
     return metrics
 
 
