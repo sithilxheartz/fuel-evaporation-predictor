@@ -1,17 +1,21 @@
 """
-RETRAIN_EVAP.PY — EMERALD LANKA
-=================================
-Full evaporation retrain pipeline.
-After retraining, automatically calculates and stores ALL evaporation
-data to Firebase fuelEvaporation collection.
+RETRAIN_EVAP.PY — EMERALD LANKA (Fixed)
+=========================================
+After retraining, syncs fuelEvaporation to always match fuelSaleHistory.
 
-Logic:
+Key fix:
+  - Date range comes from Firebase fuelSaleHistory (NOT local CSV)
+  - fuelEvaporation always matches fuelSaleHistory exactly
+  - Every date in fuelSaleHistory gets evaporation calculated
+  - If fuelSaleHistory has new dates → fuelEvaporation gets them too
+  - Second retrain → overwrites all records with fresh model results
+
+Flow:
   1. Fetch latest weather from Open-Meteo
-  2. Train all 4 XGBoost evaporation models
-  3. After training: fetch all sales from Firebase fuelSaleHistory
-  4. Calculate evaporation for every day (using fresh models)
-  5. Store/overwrite to Firebase fuelEvaporation
-     (if same date exists → overwrite with new data)
+  2. Retrain all 4 XGBoost models
+  3. Fetch ALL sales from Firebase fuelSaleHistory
+  4. Calculate evaporation for every date that has a sales record
+  5. Store/overwrite ALL to Firebase fuelEvaporation
 
 Run manually:
   python scripts/retrain_evap.py
@@ -19,6 +23,7 @@ Run manually:
 
 import os
 import sys
+import json
 import pandas as pd
 import numpy as np
 from datetime import datetime, date, timedelta
@@ -26,113 +31,39 @@ from datetime import datetime, date, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def full_evap_retrain_pipeline():
-    print("\n" + "="*60)
-    print("  EVAPORATION RETRAIN PIPELINE")
-    print("="*60)
-    started = datetime.now()
+# ─── FIREBASE ────────────────────────────────────────────────────────────────
 
-    # ── Step 1: Fetch latest weather ─────────────────────────────────────────
-    print("\n[1/4] Fetching latest weather from Open-Meteo...")
-    try:
-        from scripts.fetch_weather import fetch_historical, _add_derived_features
-
-        # Get date range from evap CSV
-        clean_path = "data/fuel_sales_evaporation.csv"
-        if os.path.exists(clean_path):
-            evap_df    = pd.read_csv(clean_path)
-            evap_df["date"] = pd.to_datetime(evap_df["date"])
-            start_date = evap_df["date"].min().strftime("%Y-%m-%d")
-        else:
-            start_date = "2025-04-01"
-
-        # Fetch up to today
-        end_date = date.today().strftime("%Y-%m-%d")
-
-        wx_df = fetch_historical(start_date, end_date)
-        wx_df.to_csv("data/weather_data.csv", index=False)
-        print(f"  Weather saved: {len(wx_df)} days ({start_date} → {end_date})")
-
-        # Also fetch 8-day forecast for predictions
-        from scripts.fetch_weather import fetch_forecast
-        fcast = fetch_forecast(days_ahead=8)
-        fcast.to_csv("data/weather_forecast.csv", index=False)
-        print(f"  Forecast saved: {len(fcast)} days")
-
-    except Exception as e:
-        print(f"  ⚠️  Weather fetch failed: {e}")
-        print("  Continuing with existing weather data...")
-
-    # ── Step 2: Train all 4 evaporation models ────────────────────────────────
-    print("\n[2/4] Training evaporation models...")
-    from scripts.train_evap_models import train_all_evap_models
-    metrics = train_all_evap_models()
-
-    # ── Step 3: Store evaporation to Firebase ────────────────────────────────
-    print("\n[3/4] Storing evaporation data to Firebase...")
-    try:
-        _store_all_to_firebase()
-    except Exception as e:
-        print(f"  ⚠️  Firebase storage failed: {e}")
-        print("  Models were trained successfully. Firebase storage can be retried.")
-
-    # ── Step 4: Update forecast ───────────────────────────────────────────────
-    print("\n[4/4] Updating weather forecast...")
-    try:
-        from scripts.fetch_weather import fetch_forecast
-        fcast = fetch_forecast(days_ahead=8)
-        fcast.to_csv("data/weather_forecast.csv", index=False)
-        print("  Forecast updated")
-    except Exception as e:
-        print(f"  ⚠️  Forecast update failed: {e}")
-
-    elapsed = (datetime.now() - started).seconds
-    print(f"\n{'='*60}")
-    print(f"  RETRAIN COMPLETE in {elapsed}s")
-    print(f"{'='*60}")
-    for fuel, m in metrics.items():
-        print(f"  {fuel:<20} CV MAPE: {m['cv_mape']:.2f}%  "
-              f"Holdout: {m['holdout_mape']:.2f}%")
-
-    return metrics
+def _init_firebase():
+    import firebase_admin
+    from firebase_admin import credentials
+    if firebase_admin._apps:
+        return
+    env_creds = os.environ.get("FIREBASE_CREDENTIALS")
+    if env_creds:
+        cred = credentials.Certificate(json.loads(env_creds))
+    else:
+        key_path = os.path.join("firebase", "serviceAccountKey.json")
+        if not os.path.exists(key_path):
+            raise FileNotFoundError(
+                f"Firebase key not found: {key_path}\n"
+                "Add FIREBASE_CREDENTIALS environment variable on Railway."
+            )
+        cred = credentials.Certificate(key_path)
+    firebase_admin.initialize_app(cred)
+    print("  ✅ Firebase connected")
 
 
-def _store_all_to_firebase():
+def _fetch_all_sales_from_firebase() -> pd.DataFrame:
     """
-    After retraining, calculate evaporation for ALL dates in Firebase
-    fuelSaleHistory and store/overwrite to fuelEvaporation.
-
-    Key behaviour:
-      - Fetches ALL sales records from Firebase
-      - Calculates evaporation using the NEWLY TRAINED models
-      - If a date already exists in fuelEvaporation → OVERWRITES it
-      - This ensures data always reflects the latest model
+    Fetch ALL sales records from Firebase fuelSaleHistory.
+    This is the source of truth for which dates need evaporation calculated.
     """
-    print("  Loading freshly trained models...")
-    from scripts.predict_evap import (
-        load_evap_models,
-        predict_evaporation_ml,
-        FUEL_PRICES_LKR,
-        FALLBACK_MONTHLY_RATES,
-    )
-    from scripts.fetch_weather import _add_derived_features
-
-    evap_models = load_evap_models("models/evaporation")
-    if not evap_models:
-        raise Exception("No models found after training")
-
-    print(f"  Loaded {len(evap_models)} fresh models")
-
-    # Connect to Firebase
-    import json
     _init_firebase()
     from firebase_admin import firestore
-    db = firestore.client()
+    db   = firestore.client()
+    docs = db.collection("fuelSaleHistory").stream()
 
-    # Fetch all sales from Firebase
-    print("  Fetching sales from Firebase fuelSaleHistory...")
-    docs     = db.collection("fuelSaleHistory").stream()
-    sales_records = []
+    records = []
     for doc in docs:
         data = doc.to_dict()
         try:
@@ -147,7 +78,7 @@ def _store_all_to_firebase():
             except Exception:
                 return 0.0
 
-        sales_records.append({
+        records.append({
             "date":         d,
             "petrol":       safe("92PetrolSale"),
             "super_petrol": safe("95PetrolSale"),
@@ -155,18 +86,84 @@ def _store_all_to_firebase():
             "super_diesel": safe("superDieselSale"),
         })
 
-    if not sales_records:
-        raise Exception("No sales records found in Firebase")
+    if not records:
+        raise ValueError("No records found in Firebase fuelSaleHistory")
 
-    sales_df   = pd.DataFrame(sales_records).sort_values("date").reset_index(drop=True)
+    df = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
+    print(f"  Fetched {len(df)} sales records from fuelSaleHistory")
+    print(f"  Range: {df['date'].min().date()} → {df['date'].max().date()}")
+    return df
+
+
+# ─── MAIN PIPELINE ───────────────────────────────────────────────────────────
+
+def full_evap_retrain_pipeline():
+    print("\n" + "="*60)
+    print("  EVAPORATION RETRAIN PIPELINE")
+    print("="*60)
+    started = datetime.now()
+
+    # ── Step 1: Fetch ALL sales from Firebase first ───────────────────────────
+    # We do this BEFORE fetching weather so we know the exact date range needed
+    print("\n[1/5] Fetching sales from Firebase fuelSaleHistory...")
+    _init_firebase()
+    sales_df   = _fetch_all_sales_from_firebase()
     first_date = sales_df["date"].min().date()
     last_date  = sales_df["date"].max().date()
-    print(f"  Found {len(sales_df)} sales records: {first_date} → {last_date}")
 
-    # Load weather data
-    print("  Loading weather data...")
-    wx_df = pd.read_csv("data/weather_data.csv")
-    wx_df["date"] = pd.to_datetime(wx_df["date"])
+    print(f"  Will calculate evaporation for: {first_date} → {last_date}")
+    print(f"  Total days: {(last_date - first_date).days + 1}")
+
+    # ── Step 2: Fetch weather for exact date range ────────────────────────────
+    print(f"\n[2/5] Fetching weather: {first_date} → {last_date}...")
+    try:
+        from scripts.fetch_weather import fetch_historical, _add_derived_features, fetch_forecast
+
+        wx_df = fetch_historical(
+            str(first_date),
+            str(last_date),
+        )
+        wx_df.to_csv("data/weather_data.csv", index=False)
+        print(f"  Weather saved: {len(wx_df)} days")
+
+        # Also fetch 8-day forecast for predictions
+        fcast = fetch_forecast(days_ahead=8)
+        fcast.to_csv("data/weather_forecast.csv", index=False)
+        print(f"  Forecast saved: {len(fcast)} days")
+
+    except Exception as e:
+        print(f"  ⚠️  Weather fetch failed: {e}")
+        print("  Continuing with existing weather data...")
+        wx_df = None
+
+    # ── Step 3: Retrain all 4 evaporation models ──────────────────────────────
+    print("\n[3/5] Training evaporation models...")
+    from scripts.train_evap_models import train_all_evap_models
+    metrics = train_all_evap_models()
+
+    # ── Step 4: Load fresh models + weather ──────────────────────────────────
+    print("\n[4/5] Loading fresh models and weather data...")
+    from scripts.predict_evap import (
+        load_evap_models,
+        predict_evaporation_ml,
+        FUEL_PRICES_LKR,
+        FALLBACK_MONTHLY_RATES,
+    )
+
+    evap_models = load_evap_models("models/evaporation")
+    print(f"  Loaded {len(evap_models)} fresh models")
+
+    # Load weather
+    try:
+        wx_df = pd.read_csv("data/weather_data.csv")
+        wx_df["date"] = pd.to_datetime(wx_df["date"])
+    except Exception as e:
+        print(f"  ⚠️  Weather data not available: {e}")
+        wx_df = pd.DataFrame()
+
+    # ── Step 5: Calculate + store evaporation for ALL sales dates ─────────────
+    print(f"\n[5/5] Calculating + storing evaporation for ALL {len(sales_df)} dates...")
+    print("  (overwrites existing records with fresh model results)")
 
     # Build lookups
     sales_lookup = {
@@ -178,40 +175,39 @@ def _store_all_to_firebase():
         }
         for _, row in sales_df.iterrows()
     }
-    weather_lookup = {
-        row["date"].strftime("%Y-%m-%d"): row
-        for _, row in wx_df.iterrows()
-    }
+
+    weather_lookup = {}
+    if not wx_df.empty:
+        weather_lookup = {
+            row["date"].strftime("%Y-%m-%d"): row
+            for _, row in wx_df.iterrows()
+        }
 
     # Load evap history for lag features
     evap_history = []
     try:
-        hist_df = pd.read_csv("data/fuel_sales_evaporation.csv")
+        hist_df      = pd.read_csv("data/fuel_sales_evaporation.csv")
         evap_history = hist_df["petrol_evap_L"].tail(30).tolist()
     except Exception:
         pass
 
-    # Process every date
-    all_dates = [
-        first_date + timedelta(days=i)
-        for i in range((last_date - first_date).days + 1)
-    ]
-
     FUEL_TYPES = ["petrol", "super_petrol", "diesel", "super_diesel"]
-    success = 0
-    failed  = 0
 
-    print(f"  Calculating + storing {len(all_dates)} days "
-          f"(overwriting existing records)...")
+    from firebase_admin import firestore
+    db = firestore.client()
 
-    # Use batch writes for speed (max 400 per batch)
-    batch     = db.batch()
+    success     = 0
+    failed      = 0
+    batch       = db.batch()
     batch_count = 0
     MAX_BATCH   = 400
 
-    for target_date in all_dates:
-        date_str = str(target_date)
-        sales    = sales_lookup.get(date_str, {
+    # Process every date that has a sales record in Firebase
+    for _, sale_row in sales_df.iterrows():
+        target_date = sale_row["date"].date()
+        date_str    = str(target_date)
+
+        sales  = sales_lookup.get(date_str, {
             "petrol": 2500.0, "super_petrol": 80.0,
             "diesel": 2800.0, "super_diesel": 120.0,
         })
@@ -219,9 +215,9 @@ def _store_all_to_firebase():
 
         try:
             doc_data = {
-                "date":       date_str,
+                "date":        date_str,
                 "generatedAt": datetime.now().isoformat(),
-                "modelType":  "ml_xgboost_weather",
+                "modelType":   "ml_xgboost_weather",
             }
 
             total_L   = 0.0
@@ -230,15 +226,15 @@ def _store_all_to_firebase():
             for fuel in FUEL_TYPES:
                 sales_L = float(sales.get(fuel, 2000.0))
 
-                # Use ML model with real weather
+                # Use ML model + real weather if available
                 if fuel in evap_models and not wx_row.empty:
                     try:
                         evap_L = predict_evaporation_ml(
-                            target_date    = target_date,
-                            fuel           = fuel,
-                            sales_litres   = sales_L,
-                            weather_row    = wx_row,
-                            model_dict     = evap_models[fuel],
+                            target_date       = target_date,
+                            fuel              = fuel,
+                            sales_litres      = sales_L,
+                            weather_row       = wx_row,
+                            model_dict        = evap_models[fuel],
                             recent_evap_vals  = evap_history,
                             recent_sales_vals = [],
                         )
@@ -253,7 +249,7 @@ def _store_all_to_firebase():
                 evap_L   = round(float(max(0, evap_L)), 5)
                 evap_lkr = round(evap_L * FUEL_PRICES_LKR[fuel], 2)
 
-                # Firebase field names
+                # Map to Firebase field names
                 fuel_key = {
                     "petrol":       "petrol",
                     "super_petrol": "superPetrol",
@@ -261,30 +257,28 @@ def _store_all_to_firebase():
                     "super_diesel": "superDiesel",
                 }[fuel]
 
-                doc_data[f"{fuel_key}EvapL"]    = evap_L
-                doc_data[f"{fuel_key}EvapLkr"]  = evap_lkr
-                doc_data[f"{fuel_key}SalesL"]   = round(sales_L, 2)
-                doc_data[f"method_{fuel_key}"]  = method
+                doc_data[f"{fuel_key}EvapL"]   = evap_L
+                doc_data[f"{fuel_key}EvapLkr"] = evap_lkr
+                doc_data[f"{fuel_key}SalesL"]  = round(sales_L, 2)
 
                 total_L   += evap_L
                 total_lkr += evap_lkr
 
-                # Update lag history
                 if fuel == "petrol":
                     evap_history.append(evap_L)
 
-            # Summary fields
+            # Summary
             doc_data["totalEvapL"]   = round(total_L, 5)
             doc_data["totalEvapLkr"] = round(total_lkr, 2)
 
             # Weather context
             if not wx_row.empty:
-                doc_data["tempMaxC"]   = float(wx_row.get("temp_max_c",  0) or 0)
-                doc_data["precipMm"]   = float(wx_row.get("precip_mm",   0) or 0)
-                doc_data["humidityMax"]= float(wx_row.get("humidity_max",0) or 0)
-                doc_data["et0Mm"]      = float(wx_row.get("et0_mm",      0) or 0)
+                doc_data["tempMaxC"]    = float(wx_row.get("temp_max_c",  0) or 0)
+                doc_data["precipMm"]    = float(wx_row.get("precip_mm",   0) or 0)
+                doc_data["humidityMax"] = float(wx_row.get("humidity_max",0) or 0)
+                doc_data["et0Mm"]       = float(wx_row.get("et0_mm",      0) or 0)
 
-            # Add to batch (SET with merge=True → creates or overwrites)
+            # Batch write — set() overwrites if exists, creates if not
             ref = db.collection("fuelEvaporation").document(date_str)
             batch.set(ref, doc_data)
             batch_count += 1
@@ -301,38 +295,26 @@ def _store_all_to_firebase():
             print(f"  ❌ {date_str}: {e}")
             failed += 1
 
-    # Commit remaining
+    # Commit remaining records
     if batch_count > 0:
         batch.commit()
 
-    print(f"\n  ✅ Stored {success} records to Firebase fuelEvaporation")
+    elapsed = (datetime.now() - started).seconds
+
+    print(f"\n{'='*60}")
+    print(f"  RETRAIN + FIREBASE SYNC COMPLETE in {elapsed}s")
+    print(f"{'='*60}")
+    print(f"  ✅ Stored {success} records to Firebase fuelEvaporation")
+    print(f"  📅 Range: {first_date} → {last_date}")
     if failed > 0:
-        print(f"  ❌ Failed: {failed} records")
+        print(f"  ❌ Failed: {failed}")
+    print()
+    print("  Model accuracy:")
+    for fuel, m in metrics.items():
+        print(f"    {fuel:<20} CV MAPE: {m['cv_mape']:.2f}%  "
+              f"Holdout: {m['holdout_mape']:.2f}%")
 
-
-def _init_firebase():
-    """Initialize Firebase connection."""
-    import json
-    import firebase_admin
-    from firebase_admin import credentials
-
-    if firebase_admin._apps:
-        return
-
-    env_creds = os.environ.get("FIREBASE_CREDENTIALS")
-    if env_creds:
-        cred = credentials.Certificate(json.loads(env_creds))
-    else:
-        key_path = os.path.join("firebase", "serviceAccountKey.json")
-        if not os.path.exists(key_path):
-            raise FileNotFoundError(
-                f"\n❌ Firebase key not found: {key_path}\n"
-                "Add FIREBASE_CREDENTIALS environment variable on Railway."
-            )
-        cred = credentials.Certificate(key_path)
-
-    firebase_admin.initialize_app(cred)
-    print("  ✅ Firebase connected")
+    return metrics
 
 
 if __name__ == "__main__":
