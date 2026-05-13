@@ -1,20 +1,18 @@
 """
-RETRAIN_EVAP.PY — EMERALD LANKA (Final Fix)
-=============================================
-Uses TWO separate weather date ranges:
+RETRAIN_EVAP.PY — EMERALD LANKA (Fixed: missing fuel fields)
+=============================================================
+Key fix:
+  Only calculates evaporation for fuels that ACTUALLY have sales
+  data in Firebase fuelSaleHistory for that date.
 
-  TRAINING weather:   2025-04-01 → 2026-04-19  → weather_data.csv
-                      Matches fuel_sales_evaporation.csv (384 rows)
-                      → models train on full dataset → best accuracy
+  If 2026-05-13 only has dieselSale and superDieselSale:
+    → only diesel and super_diesel evaporation is calculated
+    → petrol and super_petrol are stored as 0 (not fake averages)
+    → when petrol sales are added later → retrain again → updates correctly
 
-  DEPLOYMENT weather: Firebase first date → last date  → weather_deploy.csv
-                      Matches fuelSaleHistory (Feb 2026 → today)
-                      → used to calculate evaporation for each sale date
-
-Result:
-  - Models always trained on 384 rows (best accuracy)
-  - fuelEvaporation always matches fuelSaleHistory exactly
-  - Every retrain overwrites all Firebase records with fresh results
+Uses TWO separate weather files:
+  weather_data.csv    → training (Apr 2025 → Apr 2026, 384 rows)
+  weather_deploy.csv  → deployment (Firebase sales date range)
 """
 
 import os
@@ -50,7 +48,10 @@ def _init_firebase():
 
 
 def _fetch_all_sales() -> pd.DataFrame:
-    """Fetch all sales from Firebase fuelSaleHistory."""
+    """
+    Fetch all sales from Firebase fuelSaleHistory.
+    Returns None for missing fuel fields — not fake averages.
+    """
     _init_firebase()
     from firebase_admin import firestore
     db   = firestore.client()
@@ -65,11 +66,15 @@ def _fetch_all_sales() -> pd.DataFrame:
             continue
 
         def safe(key):
+            """Returns actual value or None if field missing/null."""
             v = data.get(key)
+            if v is None:
+                return None          # ← field not entered yet
             try:
-                return float(v) if v is not None else 0.0
+                f = float(v)
+                return f if f > 0 else None   # ← 0 = OOS, treat as None
             except Exception:
-                return 0.0
+                return None
 
         records.append({
             "date":         d,
@@ -80,11 +85,18 @@ def _fetch_all_sales() -> pd.DataFrame:
         })
 
     if not records:
-        raise ValueError("No records in Firebase fuelSaleHistory")
+        raise ValueError("No records found in Firebase fuelSaleHistory")
 
     df = pd.DataFrame(records).sort_values("date").reset_index(drop=True)
     print(f"  Fetched {len(df)} sales records")
     print(f"  Range: {df['date'].min().date()} → {df['date'].max().date()}")
+
+    # Show how many records have each fuel
+    for fuel, col in [("petrol","petrol"), ("super_petrol","super_petrol"),
+                      ("diesel","diesel"), ("super_diesel","super_diesel")]:
+        count = df[col].notna().sum()
+        print(f"    {fuel:<20}: {count}/{len(df)} days have sales data")
+
     return df
 
 
@@ -106,11 +118,9 @@ def full_evap_retrain_pipeline():
     sales_df   = _fetch_all_sales()
     first_date = sales_df["date"].min().date()
     last_date  = sales_df["date"].max().date()
-    print(f"  Will calculate: {first_date} → {last_date} "
-          f"({(last_date-first_date).days+1} days)")
+    print(f"  Will calculate: {first_date} → {last_date}")
 
-    # ── Step 2: Training weather — full evap CSV range ────────────────────────
-    # MUST match fuel_sales_evaporation.csv date range for full 384 rows
+    # ── Step 2: Training weather (full evap CSV range → 384 rows) ────────────
     print("\n[2/6] Fetching TRAINING weather (full evap CSV range)...")
     try:
         evap_csv = pd.read_csv("data/fuel_sales_evaporation.csv")
@@ -125,12 +135,11 @@ def full_evap_retrain_pipeline():
         train_wx = fetch_historical(t_start, t_end)
         train_wx.to_csv("data/weather_data.csv", index=False)
         print(f"  Training weather: {len(train_wx)} days "
-              f"({t_start} → {t_end}) → weather_data.csv")
+              f"({t_start} → {t_end})")
     except Exception as e:
         print(f"  ⚠️  Training weather failed: {e} — using existing")
 
-    # ── Step 3: Deployment weather — Firebase sales range ────────────────────
-    # Covers actual dates we store to fuelEvaporation
+    # ── Step 3: Deployment weather (Firebase sales date range) ───────────────
     print(f"\n[3/6] Fetching DEPLOYMENT weather "
           f"({first_date} → {last_date})...")
     deploy_wx_df = pd.DataFrame()
@@ -138,26 +147,22 @@ def full_evap_retrain_pipeline():
         deploy_wx = fetch_historical(str(first_date), str(last_date))
         deploy_wx.to_csv("data/weather_deploy.csv", index=False)
         deploy_wx_df = deploy_wx
-        print(f"  Deployment weather: {len(deploy_wx)} days "
-              f"→ weather_deploy.csv")
+        print(f"  Deployment weather: {len(deploy_wx)} days")
 
         fcast = fetch_forecast(days_ahead=8)
         fcast.to_csv("data/weather_forecast.csv", index=False)
-        print(f"  Forecast: {len(fcast)} days → weather_forecast.csv")
+        print(f"  Forecast: {len(fcast)} days")
     except Exception as e:
         print(f"  ⚠️  Deployment weather failed: {e}")
-        # Try loading existing deploy weather
         try:
             deploy_wx_df = pd.read_csv("data/weather_deploy.csv")
             deploy_wx_df["date"] = pd.to_datetime(deploy_wx_df["date"])
-            print(f"  Using cached deployment weather: "
-                  f"{len(deploy_wx_df)} days")
+            print(f"  Using cached: {len(deploy_wx_df)} days")
         except Exception:
             print("  No deployment weather — will use formula fallback")
 
-    # ── Step 4: Train models on FULL dataset (384 rows) ───────────────────────
-    # train_evap_models.py uses weather_data.csv which now covers full range
-    print("\n[4/6] Training models on FULL 384-row dataset...")
+    # ── Step 4: Train on FULL 384-row dataset ────────────────────────────────
+    print("\n[4/6] Training models on full 384-row dataset...")
     from scripts.train_evap_models import train_all_evap_models
     metrics = train_all_evap_models()
 
@@ -172,7 +177,6 @@ def full_evap_retrain_pipeline():
     evap_models = load_evap_models("models/evaporation")
     print(f"  Loaded {len(evap_models)} models")
 
-    # Load deployment weather for lookups
     if deploy_wx_df.empty:
         try:
             deploy_wx_df = pd.read_csv("data/weather_deploy.csv")
@@ -188,18 +192,19 @@ def full_evap_retrain_pipeline():
         }
     print(f"  Weather lookup: {len(weather_lookup)} dates")
 
-    # ── Step 6: Calculate + store ALL evaporation ────────────────────────────
-    print(f"\n[6/6] Calculating + storing {len(sales_df)} evaporation records...")
-    print("  Overwrites existing Firebase records with fresh model results")
+    # ── Step 6: Calculate + store evaporation ────────────────────────────────
+    print(f"\n[6/6] Calculating + storing {len(sales_df)} records...")
+    print("  Only calculates evaporation for fuels with ACTUAL sales data")
+    print("  Missing fuels stored as 0 (not fake averages)")
 
-    sales_lookup = {
-        row["date"].strftime("%Y-%m-%d"): {
-            "petrol":       float(row["petrol"])       if row["petrol"] > 0       else 2500.0,
-            "super_petrol": float(row["super_petrol"]) if row["super_petrol"] > 0 else 80.0,
-            "diesel":       float(row["diesel"])       if row["diesel"] > 0       else 2800.0,
-            "super_diesel": float(row["super_diesel"]) if row["super_diesel"] > 0 else 120.0,
-        }
-        for _, row in sales_df.iterrows()
+    FUEL_TYPES = ["petrol", "super_petrol", "diesel", "super_diesel"]
+
+    # Firebase field name mapping
+    FIREBASE_KEYS = {
+        "petrol":       "petrol",
+        "super_petrol": "superPetrol",
+        "diesel":       "diesel",
+        "super_diesel": "superDiesel",
     }
 
     evap_history = []
@@ -208,8 +213,6 @@ def full_evap_retrain_pipeline():
         evap_history = hist_df["petrol_evap_L"].tail(30).tolist()
     except Exception:
         pass
-
-    FUEL_TYPES = ["petrol", "super_petrol", "diesel", "super_diesel"]
 
     from firebase_admin import firestore
     db          = firestore.client()
@@ -222,11 +225,7 @@ def full_evap_retrain_pipeline():
     for _, sale_row in sales_df.iterrows():
         target_date = sale_row["date"].date()
         date_str    = str(target_date)
-        sales       = sales_lookup.get(date_str, {
-            "petrol": 2500.0, "super_petrol": 80.0,
-            "diesel": 2800.0, "super_diesel": 120.0,
-        })
-        wx_row = weather_lookup.get(date_str, pd.Series(dtype=float))
+        wx_row      = weather_lookup.get(date_str, pd.Series(dtype=float))
 
         try:
             doc_data = {
@@ -234,12 +233,25 @@ def full_evap_retrain_pipeline():
                 "generatedAt": datetime.now().isoformat(),
                 "modelType":   "ml_xgboost_weather",
             }
+
             total_L   = 0.0
             total_lkr = 0.0
 
             for fuel in FUEL_TYPES:
-                sales_L = float(sales.get(fuel, 2000.0))
+                fk      = FIREBASE_KEYS[fuel]
+                sales_L = sale_row[fuel]   # None if field missing in Firebase
 
+                # ── ONLY calculate if this fuel has actual sales data ──────
+                if sales_L is None or pd.isna(sales_L):
+                    # Field not entered yet — store 0, not a fake average
+                    doc_data[f"{fk}EvapL"]   = 0.0
+                    doc_data[f"{fk}EvapLkr"] = 0.0
+                    doc_data[f"{fk}SalesL"]  = 0.0
+                    continue
+
+                sales_L = float(sales_L)
+
+                # Calculate evaporation using ML model + weather
                 if fuel in evap_models and not wx_row.empty:
                     try:
                         evap_L = predict_evaporation_ml(
@@ -251,31 +263,28 @@ def full_evap_retrain_pipeline():
                             recent_evap_vals  = evap_history,
                             recent_sales_vals = [],
                         )
-                        method = "ml"
                     except Exception:
                         evap_L = sales_L * FALLBACK_MONTHLY_RATES[fuel][target_date.month]
-                        method = "formula_fallback"
                 else:
                     evap_L = sales_L * FALLBACK_MONTHLY_RATES[fuel][target_date.month]
-                    method = "formula"
 
                 evap_L   = round(float(max(0, evap_L)), 5)
                 evap_lkr = round(evap_L * FUEL_PRICES_LKR[fuel], 2)
 
-                fk = {"petrol":"petrol","super_petrol":"superPetrol",
-                      "diesel":"diesel","super_diesel":"superDiesel"}[fuel]
                 doc_data[f"{fk}EvapL"]   = evap_L
                 doc_data[f"{fk}EvapLkr"] = evap_lkr
                 doc_data[f"{fk}SalesL"]  = round(sales_L, 2)
 
                 total_L   += evap_L
                 total_lkr += evap_lkr
+
                 if fuel == "petrol":
                     evap_history.append(evap_L)
 
             doc_data["totalEvapL"]   = round(total_L, 5)
             doc_data["totalEvapLkr"] = round(total_lkr, 2)
 
+            # Weather context
             if not wx_row.empty:
                 doc_data["tempMaxC"]    = float(wx_row.get("temp_max_c",   0) or 0)
                 doc_data["precipMm"]    = float(wx_row.get("precip_mm",    0) or 0)
@@ -303,12 +312,11 @@ def full_evap_retrain_pipeline():
     elapsed = (datetime.now() - started).seconds
     print(f"\n{'='*60}")
     print(f"  ✅ COMPLETE in {elapsed}s")
-    print(f"  Stored:  {success} records to Firebase fuelEvaporation")
-    print(f"  Range:   {first_date} → {last_date}")
+    print(f"  Stored:  {success} records  📅 {first_date} → {last_date}")
     if failed:
         print(f"  Failed:  {failed}")
     print()
-    print("  Model accuracy (trained on full 384-row dataset):")
+    print("  Model accuracy (full 384-row dataset):")
     for fuel, m in metrics.items():
         print(f"    {fuel:<20} CV: {m['cv_mape']:.2f}%  "
               f"Holdout: {m['holdout_mape']:.2f}%")
