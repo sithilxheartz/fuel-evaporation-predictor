@@ -1,19 +1,11 @@
 """
-FASTAPI BACKEND — EMERALD LANKA EVAPORATION PREDICTOR v4.0
+FASTAPI BACKEND — EMERALD LANKA EVAPORATION PREDICTOR v5.0
 ============================================================
-Now includes real-time evaporation update after every sale.
+Key fix: LATEST_DATE now comes from Firebase fuelSaleHistory
+         so the UI always shows predictions from the most recent
+         sales date, not from the old CSV end date.
 
 Run: uvicorn api.main:app --host 0.0.0.0 --port $PORT
-
-Endpoints:
-  GET  /                          → welcome
-  GET  /health                    → server status
-  GET  /predict/evaporation       → tomorrow's prediction
-  GET  /predict/evaporation/7days → 7-day forecast
-  GET  /predict/summary           → tomorrow + 7days combined
-  GET  /evaporation/history       → history from Firebase
-  POST /evaporation/update        → ★ called after every sale (real-time)
-  POST /retrain                   → full retrain + Firebase sync
 """
 
 import os
@@ -47,56 +39,123 @@ def clean_json(obj):
         return {k: clean_json(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [clean_json(i) for i in obj]
-    elif isinstance(obj, (np.integer,)):
-        return int(obj)
-    elif isinstance(obj, (np.floating,)):
-        return float(obj)
-    elif isinstance(obj, (np.bool_,)):
-        return bool(obj)
-    elif isinstance(obj, (np.ndarray,)):
-        return obj.tolist()
-    else:
-        return obj
+    elif isinstance(obj, (np.integer,)):  return int(obj)
+    elif isinstance(obj, (np.floating,)): return float(obj)
+    elif isinstance(obj, (np.bool_,)):    return bool(obj)
+    elif isinstance(obj, (np.ndarray,)):  return obj.tolist()
+    else: return obj
 
 
-# ─── APP SETUP ────────────────────────────────────────────────────────────────
+# ─── APP ─────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="Emerald Lanka Evaporation Predictor v4.0",
-    description="Real-time evaporation update after every sale",
-    version="4.0.0"
+    title="Emerald Lanka Evaporation Predictor v5.0",
+    description="Real-time evaporation with Firebase-based latest date",
+    version="5.0.0"
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
-# ─── STARTUP ──────────────────────────────────────────────────────────────────
+# ─── FIREBASE INIT ────────────────────────────────────────────────────────────
 
-print("\n🚀 Starting Evaporation Predictor API v4.0...")
+_firebase_ready = False
+
+def init_firebase():
+    global _firebase_ready
+    if _firebase_ready:
+        return True
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+        if firebase_admin._apps:
+            _firebase_ready = True
+            return True
+        env = os.environ.get("FIREBASE_CREDENTIALS")
+        if env:
+            cred = credentials.Certificate(json.loads(env))
+        else:
+            key = os.path.join("firebase", "serviceAccountKey.json")
+            if not os.path.exists(key):
+                return False
+            cred = credentials.Certificate(key)
+        firebase_admin.initialize_app(cred)
+        _firebase_ready = True
+        return True
+    except Exception as e:
+        print(f"   ⚠️  Firebase init failed: {e}")
+        return False
+
+
+def get_latest_date_from_firebase() -> date:
+    """
+    Read the latest date from Firebase fuelSaleHistory.
+    This is the true source of truth for LATEST_DATE.
+    Falls back to fuelEvaporation, then local CSV.
+    """
+    try:
+        if not init_firebase():
+            raise Exception("Firebase not available")
+
+        from firebase_admin import firestore
+        db = firestore.client()
+
+        # Check fuelSaleHistory for latest sales date
+        docs  = db.collection("fuelSaleHistory").stream()
+        dates = []
+        for doc in docs:
+            try:
+                dates.append(date.fromisoformat(doc.id))
+            except Exception:
+                pass
+
+        if dates:
+            latest = max(dates)
+            print(f"   Latest date from Firebase fuelSaleHistory: {latest}")
+            return latest
+
+    except Exception as e:
+        print(f"   ⚠️  Firebase date read failed: {e}")
+
+    # Fallback to local CSV
+    try:
+        evap_df = pd.read_csv("data/fuel_sales_evaporation.csv")
+        evap_df["date"] = pd.to_datetime(evap_df["date"])
+        latest = evap_df["date"].max().date()
+        print(f"   Using CSV latest date: {latest}")
+        return latest
+    except Exception:
+        pass
+
+    # Last resort: yesterday
+    return date.today() - timedelta(days=1)
+
+
+# ─── STARTUP ─────────────────────────────────────────────────────────────────
+
+print("\n🚀 Starting Evaporation Predictor API v5.0...")
 
 print("   Loading evaporation models...")
 EVAP_MODELS = load_evap_models("models/evaporation")
 
-print("   Loading evaporation history...")
+print("   Loading evaporation history (for lag features)...")
 EVAP_HISTORY_DF = None
-LATEST_DATE     = date.today() - timedelta(days=1)
-
 try:
     EVAP_HISTORY_DF = pd.read_csv("data/fuel_sales_evaporation.csv")
     EVAP_HISTORY_DF["date"] = pd.to_datetime(EVAP_HISTORY_DF["date"])
-    LATEST_DATE = EVAP_HISTORY_DF["date"].max().date()
-    print(f"   Evap history: {len(EVAP_HISTORY_DF)} rows, latest: {LATEST_DATE}")
+    print(f"   Evap CSV: {len(EVAP_HISTORY_DF)} rows")
 except Exception as e:
     print(f"   ⚠️  Evap history not found: {e}")
 
+# ── KEY FIX: Read LATEST_DATE from Firebase ───────────────────────────────────
+print("   Reading latest date from Firebase fuelSaleHistory...")
+LATEST_DATE = get_latest_date_from_firebase()
+print(f"   ✅ LATEST_DATE = {LATEST_DATE}")
+
 RETRAIN_STATUS = {"running": False, "last_run": None, "last_result": None}
 
-print(f"   ✅ API ready! {len(EVAP_MODELS)} models loaded\n")
+print(f"   ✅ API ready! {len(EVAP_MODELS)} models | "
+      f"Predictions from: {LATEST_DATE + timedelta(days=1)}\n")
 
 EVAP_ACCURACY = {
     "petrol":       {"holdout_mape": 3.27,  "cv_mape": 9.82,  "reliability": "high"},
@@ -109,6 +168,7 @@ EVAP_ACCURACY = {
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 def get_avg_sales() -> dict:
+    """Average sales from CSV history for use in predictions."""
     if EVAP_HISTORY_DF is None:
         return {"petrol": 2500.0, "super_petrol": 80.0,
                 "diesel": 2800.0, "super_diesel": 120.0}
@@ -134,45 +194,61 @@ def build_sales_dict(n_days: int = 7) -> dict:
     return result
 
 
-def _init_firebase():
-    import firebase_admin
-    from firebase_admin import credentials
-    if firebase_admin._apps:
-        return
-    env_creds = os.environ.get("FIREBASE_CREDENTIALS")
-    if env_creds:
-        cred = credentials.Certificate(json.loads(env_creds))
-    else:
-        key_path = os.path.join("firebase", "serviceAccountKey.json")
-        cred = credentials.Certificate(key_path)
-    firebase_admin.initialize_app(cred)
+def get_weather_for_date(date_str: str):
+    """Get weather row for a specific date from cached files."""
+    for wx_file in ["data/weather_deploy.csv",
+                    "data/weather_full.csv",
+                    "data/weather_data.csv"]:
+        try:
+            wx_df = pd.read_csv(wx_file)
+            wx_df["date"] = pd.to_datetime(wx_df["date"])
+            match = wx_df[wx_df["date"].dt.strftime("%Y-%m-%d") == date_str]
+            if not match.empty:
+                return match.iloc[0]
+        except Exception:
+            continue
+
+    # Try live fetch
+    try:
+        from scripts.fetch_weather import fetch_historical
+        wx_df = fetch_historical(date_str, date_str)
+        if not wx_df.empty:
+            try:
+                existing = pd.read_csv("data/weather_deploy.csv")
+                existing["date"] = pd.to_datetime(existing["date"])
+                combined = pd.concat([existing, wx_df]).drop_duplicates(
+                    subset=["date"], keep="last")
+                combined.to_csv("data/weather_deploy.csv", index=False)
+            except Exception:
+                wx_df.to_csv("data/weather_deploy.csv", index=False)
+            return wx_df.iloc[0]
+    except Exception:
+        pass
+
+    return None
 
 
 # ─── REQUEST SCHEMA ───────────────────────────────────────────────────────────
 
 class EvaporationUpdateRequest(BaseModel):
-    """
-    Called by Flutter SalesService after every sale.
-    Only include fuels that have actual sales data.
-    Missing fuels (None) → stored as 0 in Firebase.
-    """
-    date:         str              # "2026-05-13"
-    petrol:       Optional[float]  # 92PetrolSale total for the day, None if not recorded
-    super_petrol: Optional[float]  # 95PetrolSale total
-    diesel:       Optional[float]  # dieselSale total
-    super_diesel: Optional[float]  # superDieselSale total
+    date:         str
+    petrol:       Optional[float] = None
+    super_petrol: Optional[float] = None
+    diesel:       Optional[float] = None
+    super_diesel: Optional[float] = None
 
 
-# ─── PREDICTION ENDPOINTS ────────────────────────────────────────────────────
+# ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
     return {
-        "api":     "Emerald Lanka Evaporation Predictor v4.0",
-        "station": "Emerald Lanka Filling Station, Hettipola",
-        "model":   "XGBoost + Open-Meteo weather",
-        "docs":    "/docs",
-        "tip":     "POST /evaporation/update after every sale for real-time sync",
+        "api":         "Emerald Lanka Evaporation Predictor v5.0",
+        "station":     "Emerald Lanka Filling Station, Hettipola",
+        "model":       "XGBoost + Open-Meteo weather",
+        "latest_date": str(LATEST_DATE),
+        "predicting_from": str(LATEST_DATE + timedelta(days=1)),
+        "docs":        "/docs",
     }
 
 
@@ -181,7 +257,8 @@ def health():
     return clean_json({
         "status":           "healthy",
         "evap_models":      list(EVAP_MODELS.keys()),
-        "data_latest_date": str(LATEST_DATE),
+        "latest_date":      str(LATEST_DATE),
+        "predicting_from":  str(LATEST_DATE + timedelta(days=1)),
         "retrain_running":  RETRAIN_STATUS["running"],
         "last_retrain":     RETRAIN_STATUS["last_run"],
         "timestamp":        datetime.now().isoformat(),
@@ -202,6 +279,7 @@ def predict_tomorrow():
         return clean_json({
             "generated_at":    datetime.now().isoformat(),
             "prediction_for":  str(tomorrow),
+            "data_as_of":      str(LATEST_DATE),
             "model_type":      "ml_xgboost_weather",
             "petrol":          evap.get("petrol",       {}),
             "super_petrol":    evap.get("super_petrol", {}),
@@ -229,6 +307,7 @@ def predict_7_days():
         )
         return clean_json({
             "generated_at":           datetime.now().isoformat(),
+            "data_as_of":             str(LATEST_DATE),
             "model_type":             "ml_xgboost_weather",
             "days":                   evap_7day,
             "total_7day_evap_litres": round(
@@ -276,37 +355,19 @@ def predict_summary():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ─── REAL-TIME UPDATE ENDPOINT ────────────────────────────────────────────────
+# ─── REAL-TIME UPDATE ─────────────────────────────────────────────────────────
 
 @app.post("/evaporation/update")
-def update_evaporation_for_date(req: EvaporationUpdateRequest):
-    """
-    ★ Called automatically by Flutter after every sale ★
-
-    Recalculates evaporation for one specific date using
-    the latest sales totals and stores to Firebase fuelEvaporation.
-
-    - Only calculates fuels that have actual sales (not None/0)
-    - Stores 0 for fuels with no sales yet
-    - Overwrites existing Firebase record for that date
-    - Returns in 2-3 seconds
-
-    Example body:
-    {
-      "date": "2026-05-13",
-      "petrol": null,
-      "super_petrol": null,
-      "diesel": 2049.0,
-      "super_diesel": 235.0
-    }
-    """
+def update_evaporation(req: EvaporationUpdateRequest):
+    """Called by Flutter after every sale — updates fuelEvaporation for that date."""
     try:
         target_date = date.fromisoformat(req.date)
+        wx_row      = get_weather_for_date(req.date)
 
-        # Get real weather for this date
-        wx_row = _get_weather_for_date(req.date)
+        FUEL_TYPES_MAP = ["petrol","super_petrol","diesel","super_diesel"]
+        FIREBASE_KEYS  = {"petrol":"petrol","super_petrol":"superPetrol",
+                          "diesel":"diesel","super_diesel":"superDiesel"}
 
-        # Build sales dict
         sales = {
             "petrol":       req.petrol,
             "super_petrol": req.super_petrol,
@@ -314,35 +375,24 @@ def update_evaporation_for_date(req: EvaporationUpdateRequest):
             "super_diesel": req.super_diesel,
         }
 
-        FUEL_TYPES  = ["petrol", "super_petrol", "diesel", "super_diesel"]
-        FIREBASE_KEYS = {
-            "petrol":       "petrol",
-            "super_petrol": "superPetrol",
-            "diesel":       "diesel",
-            "super_diesel": "superDiesel",
-        }
-
         doc_data = {
             "date":        req.date,
             "generatedAt": datetime.now().isoformat(),
             "modelType":   "ml_xgboost_weather",
+            "type":        "predicted",
         }
+        total_L = 0.0; total_lkr = 0.0
 
-        total_L   = 0.0
-        total_lkr = 0.0
-
-        for fuel in FUEL_TYPES:
+        for fuel in FUEL_TYPES_MAP:
             fk      = FIREBASE_KEYS[fuel]
             sales_L = sales.get(fuel)
 
-            # Only calculate if this fuel has actual sales data
             if sales_L is None or sales_L <= 0:
                 doc_data[f"{fk}EvapL"]   = 0.0
                 doc_data[f"{fk}EvapLkr"] = 0.0
                 doc_data[f"{fk}SalesL"]  = 0.0
                 continue
 
-            # Calculate evaporation
             if fuel in EVAP_MODELS and wx_row is not None:
                 try:
                     evap_L = predict_evaporation_ml(
@@ -365,87 +415,38 @@ def update_evaporation_for_date(req: EvaporationUpdateRequest):
             doc_data[f"{fk}EvapL"]   = evap_L
             doc_data[f"{fk}EvapLkr"] = evap_lkr
             doc_data[f"{fk}SalesL"]  = round(float(sales_L), 2)
-
             total_L   += evap_L
             total_lkr += evap_lkr
 
         doc_data["totalEvapL"]   = round(total_L, 5)
         doc_data["totalEvapLkr"] = round(total_lkr, 2)
 
-        # Weather context
         if wx_row is not None:
             doc_data["tempMaxC"]    = float(wx_row.get("temp_max_c",   0) or 0)
             doc_data["precipMm"]    = float(wx_row.get("precip_mm",    0) or 0)
             doc_data["humidityMax"] = float(wx_row.get("humidity_max", 0) or 0)
             doc_data["et0Mm"]       = float(wx_row.get("et0_mm",       0) or 0)
 
-        # Store to Firebase
-        _init_firebase()
+        init_firebase()
         from firebase_admin import firestore as fs
-        db = fs.client()
-        db.collection("fuelEvaporation").document(req.date).set(doc_data)
+        fs.client().collection("fuelEvaporation").document(req.date).set(doc_data)
 
         return clean_json({
-            "status":        "updated",
-            "date":          req.date,
-            "totalEvapL":    doc_data["totalEvapL"],
-            "totalEvapLkr":  doc_data["totalEvapLkr"],
-            "fuels_updated": [
-                f for f in FUEL_TYPES
-                if doc_data.get(f"{FIREBASE_KEYS[f]}EvapL", 0) > 0
-            ],
+            "status":       "updated",
+            "date":         req.date,
+            "totalEvapL":   doc_data["totalEvapL"],
+            "totalEvapLkr": doc_data["totalEvapLkr"],
         })
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _get_weather_for_date(date_str: str):
-    """
-    Get weather for a specific date.
-    Checks weather_deploy.csv first, then weather_data.csv,
-    then tries live fetch, then returns None (formula fallback).
-    """
-    import pandas as pd
-
-    # Try deployment weather cache first
-    for wx_file in ["data/weather_deploy.csv", "data/weather_data.csv"]:
-        try:
-            wx_df = pd.read_csv(wx_file)
-            wx_df["date"] = pd.to_datetime(wx_df["date"])
-            match = wx_df[wx_df["date"].dt.strftime("%Y-%m-%d") == date_str]
-            if not match.empty:
-                return match.iloc[0]
-        except Exception:
-            continue
-
-    # Try live fetch for today's date
-    try:
-        from scripts.fetch_weather import fetch_historical
-        wx_df = fetch_historical(date_str, date_str)
-        if not wx_df.empty:
-            # Cache it
-            try:
-                existing = pd.read_csv("data/weather_deploy.csv")
-                existing["date"] = pd.to_datetime(existing["date"])
-                combined = pd.concat([existing, wx_df], ignore_index=True)
-                combined = combined.drop_duplicates(subset=["date"], keep="last")
-                combined.to_csv("data/weather_deploy.csv", index=False)
-            except Exception:
-                wx_df.to_csv("data/weather_deploy.csv", index=False)
-            return wx_df.iloc[0]
-    except Exception:
-        pass
-
-    return None  # Will use formula fallback
-
-
-# ─── HISTORY FROM FIREBASE ───────────────────────────────────────────────────
+# ─── HISTORY ─────────────────────────────────────────────────────────────────
 
 @app.get("/evaporation/history")
 def get_history(days: int = 30):
     try:
-        _init_firebase()
+        init_firebase()
         from firebase_admin import firestore as fs
 
         days   = min(days, 365)
@@ -455,6 +456,8 @@ def get_history(days: int = 30):
 
         records = []
         for doc in docs:
+            if doc.id == "--summary--":
+                continue
             data     = doc.to_dict()
             date_str = doc.id
             try:
@@ -472,19 +475,17 @@ def get_history(days: int = 30):
                         "dieselSalesL":     float(data.get("dieselSalesL",     0) or 0),
                         "tempMaxC":         float(data.get("tempMaxC",         0) or 0),
                         "precipMm":         float(data.get("precipMm",         0) or 0),
-                        "modelType":        data.get("modelType", "ml"),
+                        "type":             data.get("type", "actual"),
                     })
             except Exception:
                 continue
 
         records.sort(key=lambda x: x["date"])
-
         total_l   = sum(r["totalEvapL"]   for r in records)
         total_lkr = sum(r["totalEvapLkr"] for r in records)
 
         return clean_json({
             "generated_at":     datetime.now().isoformat(),
-            "days_requested":   days,
             "records_found":    len(records),
             "records":          records,
             "period_total_L":   round(total_l, 3),
@@ -501,8 +502,11 @@ def get_history(days: int = 30):
 @app.post("/retrain")
 def trigger_retrain(background_tasks: BackgroundTasks):
     """
-    Full retrain + Firebase sync.
-    Use this monthly or when new sales data has been added in bulk.
+    Full retrain:
+      1. Merges CSV + Firebase sales for training (bigger dataset)
+      2. Retrains all 4 models
+      3. Runs evaporation pipeline (stores all data to Firebase)
+      4. Updates LATEST_DATE from Firebase
     """
     if RETRAIN_STATUS["running"]:
         return {"message": "Already retraining.", "started_at": RETRAIN_STATUS["last_run"]}
@@ -510,19 +514,26 @@ def trigger_retrain(background_tasks: BackgroundTasks):
     RETRAIN_STATUS["last_run"] = datetime.now().isoformat()
     background_tasks.add_task(_run_retrain)
     return {
-        "message":    "✅ Retrain started. Models will be retrained and all "
-                      "Firebase evaporation data updated. Check /health in 3-5 minutes.",
+        "message":    "✅ Retrain started. Models will train on CSV + Firebase data. "
+                      "Check /health in 3-5 minutes.",
         "started_at": RETRAIN_STATUS["last_run"],
     }
 
 
 def _run_retrain():
-    global EVAP_MODELS
+    global EVAP_MODELS, LATEST_DATE
     try:
-        print("\n🔄 Retrain started...")
+        print("\n🔄 Retrain started (CSV + Firebase)...")
         from scripts.retrain_evap import full_evap_retrain_pipeline
         full_evap_retrain_pipeline()
+
+        # Reload models
         EVAP_MODELS = load_evap_models("models/evaporation")
+
+        # Update latest date from Firebase
+        LATEST_DATE = get_latest_date_from_firebase()
+        print(f"✅ LATEST_DATE updated to: {LATEST_DATE}")
+
         RETRAIN_STATUS["running"]     = False
         RETRAIN_STATUS["last_result"] = "success"
         print("✅ Retrain complete!\n")
